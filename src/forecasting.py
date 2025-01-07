@@ -1,183 +1,137 @@
-import pandas as pd
+import os
+os.environ['TF_USE_LEGACY_KERAS'] = '1'
+
+import logging
+import os
+import time
+import warnings
+from argparse import ArgumentParser
+
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
-from typing import Tuple, List
-import matplotlib.pyplot as plt
+import pandas as pd
+from src.utils import reset_seeds
+import tensorflow as tf
 
-class TimeSeriesDataLoader:
-    def __init__(self, file_path: str, target_column: str):
-        """
-        Initialize the data loader
-        
-        Args:
-            file_path (str): Path to the CSV file
-            target_column (str): Name of the target variable column
-        """
-        self.file_path = file_path
-        self.target_column = target_column
-        self.scaler = MinMaxScaler()
-        self.target_scaler = MinMaxScaler()
-        
-    def load_data(self) -> Tuple[pd.DataFrame, pd.Series]:
-        """Load and preprocess the data"""
-        # Read the CSV file
-        df = pd.read_csv(self.file_path)
-        
-        # Separate features and target
-        X = df.drop(columns=[self.target_column])
-        y = df[self.target_column]
-        
-        # Scale the features and target
-        X_scaled = pd.DataFrame(
-            self.scaler.fit_transform(X),
-            columns=X.columns
+from src.evaluation_metrics import forecast_metrics
+
+
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+warnings.filterwarnings(action="ignore", message="Setting attributes")
+
+class TimeSeriesForecaster:
+    def __init__(self):
+        self.model = None
+        self.model_name = None
+        self.back_horizon = None 
+        self.horizon = None
+        self.n_in_features = None
+        self.n_out_features = None
+        self.history = None
+        self.mean_smape = None
+        self.mean_rmse = None
+        self.Y_preds = None
+
+    def train_model(self, model_name, dataset, back_horizon, horizon):
+        # Store parameters
+        self.model_name = model_name
+        self.back_horizon = back_horizon
+        self.horizon = horizon
+        self.n_in_features = dataset.X_train.shape[2]
+        self.n_out_features = 1
+
+        ###############################################
+        # ## 2.0 Forecasting model
+        ###############################################
+        # reset seeds for numpy, tensorflow, python random package and python environment seed
+        self.model = self._build_model()
+
+        # Define the early stopping criteria
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", min_delta=0.0001, patience=10, restore_best_weights=True
         )
-        y_scaled = self.target_scaler.fit_transform(y.values.reshape(-1, 1))
-        
-        return X_scaled, y_scaled.ravel()
 
-def create_sequences(
-    X: pd.DataFrame,
-    y: np.ndarray,
-    back_horizon: int,
-    forecast_horizon: int,
-    train_size: float = 0.8
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
-    """
-    Create sequences for time series forecasting
-    
-    Args:
-        X (pd.DataFrame): Feature matrix
-        y (np.ndarray): Target variable
-        back_horizon (int): Number of past time steps to consider
-        forecast_horizon (int): Number of future time steps to predict
-        train_size (float): Proportion of data to use for training
-        
-    Returns:
-        Tuple containing X_train, y_train, X_test, y_test as sequences
-    """
-    X_sequences = []
-    y_sequences = []
-    
-    # Create sequences
-    for i in range(len(X) - back_horizon - forecast_horizon + 1):
-        X_sequences.append(X.iloc[i:(i + back_horizon)].values)
-        y_sequences.append(y[i + back_horizon:i + back_horizon + forecast_horizon])
-    
-    X_sequences = np.array(X_sequences)
-    y_sequences = np.array(y_sequences)
-    
-    # Split into train and test
-    train_size = int(len(X_sequences) * train_size)
-    
-    X_train = X_sequences[:train_size]
-    y_train = y_sequences[:train_size]
-    X_test = X_sequences[train_size:]
-    y_test = y_sequences[train_size:]
-    
-    return X_train, y_train, X_test, y_test 
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.FloatTensor(y)
-    
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-class LSTMForecaster(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int,
-        output_size: int,
-        dropout: float = 0.2
-    ):
-        super().__init__()
-        
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+        # Train the model
+        self.history = self.model.fit(
+            dataset.X_train,
+            dataset.Y_train,
+            epochs=200,
+            batch_size=64,
+            validation_data=(dataset.X_val, dataset.Y_val),
+            callbacks=[early_stopping],
         )
-        
-        self.linear = nn.Linear(hidden_size, output_size)
-    
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        # Use only the last output for prediction
-        predictions = self.linear(lstm_out[:, -1, :])
-        return predictions
 
-def train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    epochs: int,
-    learning_rate: float,
-    device: str
-) -> List[float]:
-    """Train the LSTM model"""
-    model = model.to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(epochs):
-        # Training
-        model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-            
-            optimizer.zero_grad()
-            y_pred = model(X_batch)
-            loss = criterion(y_pred, y_batch)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device)
-                
-                y_pred = model(X_batch)
-                val_loss += criterion(y_pred, y_batch).item()
-        
-        train_loss = train_loss / len(train_loader)
-        val_loss = val_loss / len(val_loader)
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        
-        if (epoch + 1) % 10 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-    
-    return train_losses, val_losses
+        # Predict on the testing set (forecast)
+        self.Y_preds = self.model.predict(dataset.X_test)
+        self.mean_smape, self.mean_rmse = forecast_metrics(dataset, self.Y_preds)
 
-def plot_losses(train_losses: List[float], val_losses: List[float]):
-    """Plot training and validation losses"""
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Losses')
-    plt.legend()
-    plt.show()
+        print(
+            f"[[{self.model_name}]] model trained, with test sMAPE score {self.mean_smape:0.4f}; test RMSE score: {self.mean_rmse:0.4f}."
+        )
+
+    def _build_model(self):
+        reset_seeds(42)
+        
+        if self.model_name in ["wavenet", "seq2seq"]:
+            return self._build_tfts_model()
+        elif self.model_name == "gru":
+            model = tf.keras.models.Sequential(
+                [
+                    tf.keras.layers.Input(shape=(self.back_horizon, self.n_in_features)),
+                    # Shape [batch, time, features] => [batch, time, gru_units]
+                    tf.keras.layers.GRU(100, activation="tanh", return_sequences=True),
+                    tf.keras.layers.GRU(50, activation="tanh", return_sequences=False),
+                    # Shape => [batch, time, features]
+                    tf.keras.layers.Dense(self.horizon, activation="linear"),
+                    tf.keras.layers.Reshape((self.horizon, self.n_out_features)),
+                ]
+            )
+
+            # Definition of the objective function and the optimizer
+            optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+            model.compile(optimizer=optimizer, loss="mae")
+            return model
+        else:
+            print("Not implemented: model_name.")
+            return None
+        
+    def _build_tfts_model(self):
+        import tfts
+
+        inputs = tf.keras.layers.Input([self.back_horizon, self.n_in_features])
+        if self.model_name == "wavenet":
+            backbone = tfts.AutoModel(
+                self.model_name,
+                predict_length=self.horizon,
+                custom_model_params={
+                    "filters": 256,
+                    "skip_connect_circle": True,
+                },
+            )
+        elif self.model_name == "seq2seq":
+            backbone = tfts.AutoModel(
+                "seq2seq",
+                predict_length=self.horizon,
+                custom_model_params={"rnn_size": 256, "dense_size": 256},
+            )
+        else:
+            print("Not implemented: build_tfts_model.")
+        outputs = backbone(inputs)
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+        model.compile(optimizer=optimizer, loss="mae")
+
+        return model
+
+    def predict(self, x):
+        """Predict using the underlying model
+        Parameters
+        ----------
+        x : array-like
+            Input samples
+        Returns
+        -------
+        array-like
+            Model predictions
+        """
+        return self.model.predict(x)
